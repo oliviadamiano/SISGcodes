@@ -1,0 +1,377 @@
+---
+title: "EWAS_exercise.Rmd"
+author: "Karen Conneely"
+date: "2024-05-20"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+In this exercise, we will perform an EWAS for the variable age, based on whole blood samples (white blood cells) taken from 398 boys aged 3-17 years
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Note that we have pre-installed all packages needed for these exercises
+### Thus, you do NOT need to run the commented-out code below
+### It's provided here just in case it's useful in the future
+#install.packages("tidyverse")
+#install.packages("BiocManager")
+#BiocManager::install("GEOquery",force=TRUE)
+#install.packages("CpGassoc",force=TRUE)
+#install.packages("Tmisc",force=TRUE)
+
+#Call libraries we'll need
+library(tidyverse)
+library(GEOquery)   # Useful for reading in GEO data
+library(CpGassoc)   # One of several packages that facilitates EWAS
+library(Tmisc)      # Includes corner() function for viewing data frames
+```
+
+The GEOquery package allows you to grab datasets directly from GEO using the accession code:
+```{r read_from_geo}
+gse <- getGEO("GSE27097", GSEMatrix = TRUE)
+show(gse)
+```
+
+Once read in, functions from the Biobase library allow you to parse the GEO series matrix correctly. The next three chunks extract the phenotypes, annotation, and beta values from the GEO "series matrix" object "gse"
+
+```{r read pheno}
+pheno <- pData(gse[[1]])
+print(dim(pheno))
+head(pheno)
+```
+
+```{r read annotation}
+annotation <- fData(gse[[1]])
+print(dim(annotation))
+head(annotation)
+```
+
+```{r read beta values}
+beta <- assayData(gse[[1]])$exprs
+print(dim(beta))
+print(names(beta))
+corner(beta) #This is a nifty function that prints just the top corner (equivalent to beta[1:5,1:5])
+
+rm(gse)    # Remove large data from environment once we're done with it 
+gc()       # We'll do this periodically to free up RAM for next steps
+```
+
+From above, it appears that we have DNA methylation beta values for 27,578 sites for 494 samples. We also have phenotype data for 494 samples.
+
+One thing to check before we get started: does the order of the 494 sample IDs match in the phenotype and DNAm datasets?
+```{r checkorder}
+table(row.names(pheno)==colnames(beta))
+### If it shows TRUE for all values, then the order is the same!
+### Another way to do this is the function 'identical', though this
+### won't tell you how many mismatches you have
+identical(row.names(pheno),colnames(beta))
+
+### If the IDs are not sorted identically in the two datasets, 
+### we would need to reorder as below and check again:
+#k1 <- order(row.names(pheno)
+#pheno <- pheno[k1,]  # Reordering rows in alphanumeric order
+#k2 <- order(colnames(beta))
+#beta <- beta[,k2]  # Reordering columns in alphanumeric order
+#table(row.names(pheno)==colnames(beta))  # Checking again
+```
+
+For GEO datasets the order will generally be the same, but in many other datasets it won't be - always good to check and reorder if necessary.
+
+Basic Diagnostics
+
+Let's visualize the DNAm data in a PCA (principal components analysis) plot
+```{r pca}
+beta0 <- na.omit(beta)
+pca_beta <- prcomp(beta0,scale=T)
+pc <- as.data.frame(pca_beta$rotation)
+
+rm(pca_beta)
+gc()
+
+ggplot(pc, aes(x=PC1, y=PC2)) + 
+  geom_point()
+```
+
+Q: Why do we see two distinct clusters of samples in the PCA plot?
+
+A: This GEO dataset includes technical control samples that were run along with the samples of interest for QC/diagnostic purposes.
+```{r separate tech controls}
+table(pheno$`cell type:ch1`,pheno$`sample id:ch1`)
+### There are 20 technical replicates of the same whole blood sample 
+### 76 technical controls from cell lines (but not true technical duplicates)
+### 398 whole blood (white blood cells) samples, our samples of interest
+
+### This explains the clustering we saw in the PCA plot
+k <- order(pheno$`sample id:ch1`,decreasing=TRUE) 
+  #Reordering controls which points are displayed 'in front'
+ggplot(pc[k,], aes(x=PC1, y=PC2)) + 
+  geom_point(aes(col=pheno$`sample id:ch1`[k]))
+```
+
+PCA plot shows that one set of controls clusters separately. The table printed to the console shows that these controls were from lymphoblast cell lines rather than leukocyte (white blood cell or WBC) samples 
+
+We also could have visualized this via hierarchical clustering
+```{r make heatmap}
+# Define colors for sample groups
+groupcolors <- matrix("grey",length(pheno$`sample id:ch1`))
+groupcolors[pheno$`sample id:ch1`=="EBSC_CTL"] = "blue"
+groupcolors[pheno$`sample id:ch1`=="HG_CTL"] = "red"
+groupcolors[pheno$`sample id:ch1`=="Failed.HG_CTL"] = "green"
+
+# Select 2000 random rows to plot
+k <- sample(dim(beta0)[1],2000)
+
+# Make heatmap
+plot(heatmap(beta0[k,],ColSideColors=groupcolors))
+
+# Free up memory since we're done with beta0
+rm(beta0,groupcolors)
+gc()
+```
+
+For some more diagnostics, we'll extract the 20 EBSC controls (technical duplicates of the same WBC sample) and make scatterplots to examine concordance across these 20 replicates
+```{r examine_reps}
+reps <- beta[,pheno$`sample id:ch1`=="EBSC_CTL"]
+
+par(ask=TRUE)   # Option to wait for user input before each plot
+for (i in 1:4) {
+   j1 <- 5*i-4
+   j2 <- 5*i
+   pairs(reps[,j1:j2],cex=.2)  
+}
+```
+
+Now we'll extract just the 398 samples for the EWAS, and create a data frame of phenotypes for these samples as well
+```{r make matrix of beta values}
+par(ask=FALSE)  # Reset the "ask" option to default value
+
+beta_final <- beta[,pheno$`sample id:ch1`=="s1"]
+corner(beta_final)
+
+pheno_final <- pheno[pheno$`sample id:ch1`=="s1",]
+corner(pheno_final)
+
+###Ensure again that phenotype and DNAm data are in same order
+table(row.names(pheno_final)==colnames(beta_final))
+
+rm(beta,reps)
+gc()
+```
+
+Now that we've removed technical controls, let's look at a PCA plot of just our samples of interest.
+```{r pca}
+beta_forpca <- na.omit(beta_final)
+pca_beta_final <- prcomp(beta_forpca,scale=T)
+pc_final <- as.data.frame(pca_beta_final$rotation)
+rm(beta_forpca,pca_beta_final)
+gc()
+
+ggplot(pc_final, aes(x=PC1, y=PC2)) + 
+  geom_point()
+```
+
+We still see some mild clustering. What is it?
+
+Could it be race/ethnicity?
+```{r pcaplot race}
+table(pheno_final$`ethnicity:ch1`)
+
+ggplot(pc_final, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(col=pheno_final$`ethnicity:ch1`))
+### Does not appear to explain the clustering
+```
+
+How about batch? There's a variable called "experiment"
+```{r pcaplot batch}
+ggplot(pc_final, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(col=as.numeric(pheno_final$`experiment:ch1`)))
+
+### This supports that we'll want to adjust for batch and/or chip
+
+### Samples were spread out across 92 different beadchips 
+length(unique(pheno_final$`sentrix id:ch1`))
+
+### To be very conservative about batch effects, we can include a fixed effect for beadchip in our model
+```
+
+EWAS for age
+
+Getting the data into the right format
+```{r get ready for ewas}
+help("cpg.assoc") 
+
+### Define age variable and make sure it has numeric format
+### Recall that we already made sure sort order of beta and pheno_final are the same
+age <- pheno_final$`age at collection (months):ch1`  #Age in months
+print(class(age))
+age0 <- as.numeric(age)
+print(age[1:5])
+print(age0[1:5])
+
+# Be careful of this - if a numeric variable enters a model as a character variable, R will convert it to a factor (categorical) variable
+```
+
+Now we'll perform our EWAS
+```{r ewas}
+###WEWAS adjusted for beadchip
+age_ewas <- cpg.assoc(beta.val=beta_final, indep=age0, chip.id=pheno_final$`sentrix id:ch1`)
+
+age_ewas
+```
+Summary output shows that 781 sites were significantly associated with age according to a Bonferroni criterion (Holm), while 2928 would be considered significant using a False Discovery Rate criterion (FDR<.05)
+
+These associations were observed after adjusting for technical factors due to batch by adjusting for the chip each sample was run on.  Were there other covariates we should have included?
+
+Since these were samples of white blood cells, one possible confounder is the proportions of different blood cell types in each sample.  If cell type composition changes with age, not adjusting for this variable could lead to detection of spurious associations between age and methylation.
+
+To adjust for this, we'll read in a dataset of cell type proportions for these individuals, estimated using the approach of Houseman et al. 2012 
+```{r}
+load('./datasets/cellcount.rda')
+ls()   # There's a new object in the environment called cellprop
+class(cellprop) 
+dim(cellprop)
+head(cellprop)
+
+table(row.names(cellprop)==colnames(beta_final))
+### Making sure samples are ordered the same across datasets
+```
+
+We'll now re-run the EWAS using 5 of the 6 cell type proportions as covariates 
+(Why just 5?  Because the 6 proportions will generally sum to 1, so the 6th is redundant and would be collinear in our model.)
+```{r ewas adjusted for cell proportions}
+###WEWAS adjusted for beadchip and cell proportions
+age_ewas_ct <- cpg.assoc(beta.val=beta_final, indep=age0, covariates=cellprop[,-6], chip.id=pheno_final$`sentrix id:ch1`)
+
+###Excluding one category since the proportions sum to one
+
+age_ewas_ct
+```
+After adjusting for cell type proportions, 343 sites were Holm-significant while 2014 would be considered significant at FDR<.05
+
+Did these additional covariates change the overall pattern of results?  We can compare the regression slopes from the two different models to see:
+```{r}
+names(age_ewas)
+coef1 <- age_ewas$coefficients
+coef2 <- age_ewas_ct$coefficients
+
+head(coef2)
+
+# A good old-fashioned base R scatterplot
+plot(coef1$effect.size,coef2$effect.size,xlim=c(-.0015,.0015),ylim=c(-.0015,.0015))
+lines(c(-10,10),c(0,0),lty=2)
+lines(c(0,0),c(-10,10),lty=2)
+abline(0,1,col="red")
+```
+We can see some attenuation of the effect size after cell type adjustment but the overall pattern of association with age remains consistent.  This suggests that the association between age and DNAm is robust to adjustment for cell type.
+
+Running cpg.assoc twice created two CpGassoc objects called age_ewas and age_ewas_ct. There are different ways to extract results from these objects, which we'll cover, but first let's visualize our results.
+
+To see what's available in a package, we can use the help function as below:
+```{r help with package}
+help(package="CpGassoc")
+```
+#help(manhattan)
+So if we want to make a Manhattan plot, we'll need the object we just created as well as some annotation information - specifically cgname, chromosome, and position. Fortunately we have all of this in the annotation file we extracted from the GEO file:
+```{r inspect annotation file}
+head(annotation)
+```
+
+We can see three columns useful for a Manhattan plot: ID, Chr, and MapInfo. Let's make the plot:
+```{r manhattan plot}
+manhattan(age_ewas_ct,cpgname=annotation$ID,chr=annotation$Chr,pos=annotation$MapInfo,point.size=0.3)
+```
+Note that the solid horizontal line represents Holm significance, while the dotted line shows the cutoff for FDR<.05.  
+
+We can also ask for a bidirectional plot depending on whether DNAm is increasing or decreasing with age:
+```{r bidirectional manhattan plot}
+manhattan.reflect(age_ewas_ct,cpgname=annotation$ID,chr=annotation$Chr,pos=annotation$MapInfo,point.size=0.3)
+```
+
+What does this relationship look like for individual CpG sites? Scatterplots are one way to visualize this:
+```{r help}
+help(scatterplot)
+```
+
+We can ask for scatterplots for top-ranking CpGs or can ask by cgname
+```{r scatterplots of 3 most-associated CpGs}
+scatterplot(age_ewas_ct,cpg.rank=1:3)
+```
+
+We can also examine inflation with a QQ (quantile-quantile) plot. Note that genomic inflation is sometimes expected in epigenetic studies if the phenotype studied is likely to dysregulate the epigenome. This includes phenotypes such as aging, cancer, and cell/tissue type.
+```{r qqplot}
+plot(age_ewas_ct,gcdisplay=TRUE)  # Inflation factor of 2.79
+plot(age_ewas,gcdisplay=TRUE) # Interestingly, inflation lower for EWAS unadjusted for cell proportions
+```
+
+A genomic control factor >1 indicates genomic inflation. However, in epigenetic studies this isn't necessarily a sign of confounding. In this case the median test statistic is inflated (i.e. greater than the expected median under the null) because changes are taking place across the entire epigenome during childhood.
+
+Now we'll extract CpG-level results from the CpGassoc object:
+```{r read in results file}
+names(age_ewas_ct)
+
+results <- age_ewas_ct$results
+
+class(results)
+dim(results)
+head(results)
+```
+
+This will enable us to dig deeper into what we've found.  
+```{r table}
+table(results$FDR<.05,results$T.statistic>0)
+```
+So among the 2014 FDR-significant sites, 1266 (63%) showed decreased methylation in older individuals.
+
+We have the cgnames of the significant sites, but what does that tell us?  Not much! To learn something about the biology, we might like to know what genes these CpGs are near, or whether they tend to lie near specific genomic features 
+
+Next step would be to annotate these CpGs to genes and other genomic features to assess whether significant CpGs are enriched for particular features or gene sets.
+
+We can do some very basic enrichment tests using the annotation we got from GEO. First, we'll merge this annotation onto our results file:
+```{r merge on annotation}
+head(annotation)
+
+annotated_results <- merge(results,annotation[,c("Chr","MapInfo","Symbol","CPG_ISLAND")],by.x="CPG.Labels",by.y="row.names")
+dim(annotated_results)
+head(annotated_results)
+```
+
+Here we can test whether age-increasing and age-decreasing CpGs are more or less likely to be found on CpG islands
+
+```{r create logical (TRUE-FALSE) variables}
+### Creating logical indicators for age-increasing and age-decreasing CpGs
+age_incr <- annotated_results$FDR<.05 & annotated_results$T.statistic>0
+age_decr <- annotated_results$FDR<.05 & annotated_results$T.statistic<0
+table(age_incr)
+table(age_decr)
+table(age_incr,age_decr)
+
+### Logical indicator for whether a CpG resides on a CpG island
+island <- annotated_results$CPG_ISLAND
+table(island)
+```
+
+```{r enrichment of age-increasing CpGs for CpG islands}
+table(age_incr,island)      
+chisq.test(table(age_incr,island))    # For 2x2 tables, a chi-squared or Fisher's exact test 
+fisher.test(table(age_incr,island))   # can formally test whether this depletion is significant
+```
+Age-increasing sites show enrichment for CpG islands (OR=1.36)
+
+```{r enrichment of age-decreasing CpGs for CpG islands}
+table(age_decr,island)      
+chisq.test(table(age_decr,island))    # For 2x2 tables, a chi-squared or Fisher's exact test 
+fisher.test(table(age_decr,island))   # can formally test whether this depletion is significant
+```
+Age-decreasing sites are depleted for CpG islands, with an OR of 0.21 and a p-value < 2.2e-16
+
+For later array versions Illumina provides richer annotation files, with information on other features such as enhancers, so many similar enrichment tests are possible.
+
+We do have information on genes annotated to these CpG sites.  These can be useful to characterize individual sites or sets of associated sites.  In Project 2 we'll carry out gene ontology analyses on our sets of age-increasing and decreasing sites.
+
+This is the end of Project 1. We'll conclude by saving our results file for use in future analyses.
+
+```{r save results}
+save(age_ewas,age_ewas_ct,file="./output_files/EWAS_exercise.rda")
+```
