@@ -375,3 +375,92 @@ This is the end of Project 1. We'll conclude by saving our results file for use 
 ```{r save results}
 save(age_ewas,age_ewas_ct,file="./output_files/EWAS_exercise.rda")
 ```
+####GENE ONTOLOGY#####
+
+title: "GeneOntology_exercise.Rmd"
+author: "Karen Conneely"
+date: "2024-05-22"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+In this exercise, we will read in the results from our EWAS in Exercise 1 and use them to perform downstream analyses and interpret our results
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Note that we have pre-installed all packages needed for these exercises
+### Thus, you do NOT need to run the commented-out code below
+### It's provided here just in case it's useful in the future
+#BiocManager::install("missMethyl")
+
+library(tidyverse)
+library(CpGassoc)   # Will need this to read our results object
+library(Tmisc)      # Includes corner() function 
+library(missMethyl)   # Includes function for gene ontology analysis
+```
+
+Read in the CpGassoc object we created in exercise 1 and extract our results as a data frame
+```{r read in results file}
+load("./output_files/EWAS_exercise.rda")
+ls()
+names(age_ewas)
+
+results <- age_ewas$results
+results_ct <- age_ewas_ct$results
+
+dim(results_ct)
+head(results_ct)
+```
+
+Define significance sets for CpGs showing increased or decreased DNAm with age
+```{r set up for GO analysis}
+allcpgs <- results_ct[,1]
+sigset_incr <- results_ct[results_ct$FDR<.01 & results_ct$T.statistic>0,1]
+sigset_decr <- results_ct[results_ct$FDR<.01 & results_ct$T.statistic<0,1]
+```
+
+Perform GO analysis for CpG sites showing increased DNAm with age
+```{r GO analysis for CpGs showing increased DNAm with age}
+
+go1 <- gometh(sig.cpg=sigset_incr,all.cpg=allcpgs,collection="GO",plot.bias=TRUE)
+
+class(go1)    # Output is a dataframe
+dim(go1)      # with 21889 rows for all of the different ontologies
+head(go1)     # Currently sorted in order of the numbered gene ontology terms
+
+table(go1$ONTOLOGY)   
+# From help menu: BP=biological process, CC=cellular component, MF=molecular function
+
+go1b <- go1[go1$ONTOLOGY=="BP",]  #Common to restrict focus to biological processes
+
+k <- order(go1b$P.DE)    #We'll reorder it by p-value
+go_incr <- go1b[k,]
+head(go_incr)   
+table(go_incr$FDR<.05)  
+```
+Are any GO terms significantly enriched (FDR<.05) in age-increasing sites?  If so, how many?  Which ones?
+
+Perform GO analysis for CpG sites showing decreased DNAm with age
+```{r GO analysis for CpGs showing decreased DNAm with age}
+
+go2 <- gometh(sig.cpg=sigset_decr,all.cpg=allcpgs,collection="GO",plot.bias=TRUE)
+
+go2b <- go2[go2$ONTOLOGY=="BP",]  #Common to restrict focus to biological processes
+
+k <- order(go2b$P.DE)    #We'll reorder it by p-value
+go_decr <- go2b[k,]
+head(go_decr)
+table(go_decr$FDR<.05)
+```
+How many GO terms are enriched (FDR<.05) among age-decreasing CPG sites?
+
+```{r List significantly enriched GO processes}
+go_decr$TERM[go_decr$FDR<.05]
+```
+Many of these terms are related to defense responses and immune system processes
+
+Output can be saved and used to make tables or figures for presentation
+```{r save results}
+save(go_incr,go_decr,file="./output_files/GeneOntology_exercise.rda")
+```
