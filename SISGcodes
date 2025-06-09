@@ -464,3 +464,594 @@ Output can be saved and used to make tables or figures for presentation
 ```{r save results}
 save(go_incr,go_decr,file="./output_files/GeneOntology_exercise.rda")
 ```
+####PREPROCESSING METHYLATION DATA#####
+
+---
+title: "Preprocessing_pipeline.Rmd"
+author: "Karen Conneely"
+date: "2024-05-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Call libraries we'll need
+library(tidyverse)
+library(preprocessCore)
+library(minfi)
+library(FlowSorted.Blood.450k)
+library(CpGassoc)
+library(Tmisc)
+```
+
+STEP 1: Read in sample information and idat files
+
+Load sample info and define sample list 
+```{r readin}
+# Read in a dataset containing basic sample info 
+load('./datasets/sampleinfo.rda')
+ls()
+
+sampleinfo
+
+sample_list <- row.names(sampleinfo)
+```
+
+Use this list to read in idat files and save to interim file 
+```{r read in idats}
+# read.metharray is a minfi function to read in idat files
+rgset=read.metharray(paste0('./datasets/',sample_list),verbose=TRUE)
+
+save(rgset,file="./output_files/read_idat.rda")
+```
+With datasets of hundreds or thousands of samples this file will be quite large and data steps will be more time-consuming.  In these cases it makes sense to run these numbered steps as a series of smaller programs, saving intermediate datafiles at each step.  But we'll continue on since this dataset is small.
+
+STEP 2: Pre-processing
+
+We'll start by inspecting the data object created by minfi
+```{r reload and examine data}
+#load("./output_files/read_idat.rda")
+# No need to load this since the data are already in the environment
+
+class(rgset)  # Has class RGChannelSet - this is data from the red+green signals
+dim(rgset)
+rgset   #Note that it lists an internal annotation set.  For 450k and EPIC v1 arrays minfi detects the array type and identifies a built-in annotation file to use
+```
+
+Use the minfi rgSet object to estimate cell counts via the Houseman approach
+```{r estimate cell counts}
+help(estimateCellCounts)
+# Note that there is an option for different sample types
+# Currently blood, cord blood, or DLPFC (dorsolateral prefrontal cortext)
+
+cellcounts <- estimateCellCounts(rgset)
+
+cellcounts
+```
+
+Before preprocessing the data we'll extract the detection p-values and raw beta values for later use
+```{r extract detection p-values and raw beta values}
+pval <- detectionP(rgset)
+beta_raw <- getBeta(rgset)
+
+dim(pval)
+corner(pval)
+dim(beta_raw)
+corner(beta_raw)
+```
+
+Perform noob background correction with dye-bias normalization
+```{r}
+mset <- preprocessNoob(rgset)
+
+print(class(mset))  # The resulting object has class MethylSet
+print(dim(mset))    # This class contains the beta, U, and M matrices
+beta_noob <- getBeta(mset)   # though we have to use a function to get them.
+# Save the noob-corrected beta values (we'll see these again in the next exercise)
+save(beta_noob,file="./output_files/SATSA_beta_noob.rda")
+
+# How does the noob correction change the data?
+# We'll do scatterplots for several samples to check
+par(ask=TRUE)
+# Plotting just 50,000 sites to avoid slowdown
+for (i in 1:3) {
+   plot(beta_raw[1:50000,i],beta_noob[1:50000,i],cex=.2)
+}
+```
+
+Density bean plot can be used to visualize and compare overall DNAm distribution before and after the noob correction
+```{r before correction}
+densityBeanPlot(rgset)
+```
+
+```{r after correction}
+densityBeanPlot(mset)
+```
+
+STEP 3: Remove CpGs with underlying SNPs, if desired
+```{r remove CpGs with SNPs}
+gset <- dropLociWithSnps(mapToGenome(mset),snps = c("CpG", "SBE"), maf = 0.01)
+# This removes any CpG that directly overlaps a SNP with MAF>.01, 
+# or has one overlapping the single-base extension (SBE)
+
+class(gset)  # Object has class GenomicMethylSet because we mapped it to the genome so we could take advantage of the annotation information
+gset  # Note that we have 17,302 fewer CpG sites after this filter
+```
+If we want to be more cautious, we could also remove CpGs with a SNP anywhere in the 50-bp probe.  This could be useful for an mQTL analysis since those CpGs might appear associated with their probe SNPs for technical reasons.  In this case we would set snps = c("Probe,","CpG", "SBE") and we would lose ~100K CpGs. (but this might also be overly conservative - current recommendations are to remove CpGs with SNPs within 10bp, rather than the entire 50bp probe.)
+
+This would be another good intermediate stopping point if working with a large dataset:
+```{r intermediate save}
+save(gset, cellcounts, pval,  file="./output_files/preprocessed.rda")
+
+# Now that we've removed CpGs with overlapping SNPs, we'll define a new beta_noob and drop the old one to free up memory
+beta_noob_final <- getBeta(gset)
+rm(beta_noob,beta_raw)  # Don't need these anymore, so we'll free up some memory
+gc()  #empties trash (the name of this function is "Garbage Collection")
+```
+
+STEP 4: Diagnostics - sex check and clustering
+```{r sex check}
+#load("./output_files/preprocessed.rda")
+
+pred_sex <- getSex(gset)  # Sex check to identify sample swaps
+
+pred_sex   # List sex as inferred from DNAm data
+sampleinfo # Compare to sex reported in sample info
+```
+Sex was correctly predicted as female in all 11 samples.  The full dataset included both sexes, so this would be a good way to check for sample swaps.
+
+PCA or hierarchical clustering are useful ways to check for outlying samples
+```{r pca}
+pca_beta_noob <- as.data.frame(prcomp(beta_noob_final,scale=T)$rotation)
+
+ggplot(pca_beta_noob, aes(x=PC1, y=PC2)) + 
+  geom_point()
+```
+
+Plotting the first PC by age, we see that the outlier is the oldest subject.  This might or might not be the reason it clusters separately.
+```{r scatterplot with age}
+table(row.names(sampleinfo)==colnames(beta_noob_final))
+
+ggplot(pca_beta_noob, aes(x=sampleinfo$Age, y=PC1)) + 
+  geom_point()
+```
+In reality, it's hard to tell how much of an outlier this sample is without looking at the full dataset (385 Swedish twins each measured at 1-5 longitudinal timepoints).  It would also be useful to see this sample in the context of other samples on the same chip.
+
+If it turns out to be an outlier in the full dataset, there are a couple ways to proceed:
+1) Check bisulfite conversion and other technical control measures using qcReport(rgset).  Doing this creates a PDF that's already in your folder; the outlying sample is 9721365047_R01C02, the 4th one down on most pages of the report.  To me it doesn't look that different from the others, but the technicians who process these samples at the core would be the best judge of that - they will normally flag or remove samples failing these initial QC measures.
+2) Simply remove it - many studies will set a cutoff where they remove outliers whose first PC is 3 or 4 SD away from the median.
+
+STEP 5: identify/remove poorly performing samples or probes
+```{r QC with cpg.qc}
+help(cpg.qc)
+# A CpGassoc function that sets to missing data points with high detection p-value or low signal, and removes CpGs or samples with high proportion of missing values (user specifies threshold)
+
+# We have two of the four objects we need already (beta_noob_final and p-val)
+# Grab signals from gset object
+meth_signal <- getMeth(gset)
+unmeth_signal <- getUnmeth(gset)
+
+# Subset pval matrix so that CpGs we filtered are removed, and resort
+pval_final <- pval[row.names(beta_noob_final),]
+identical(row.names(pval_final),row.names(meth_signal))
+
+# QC filtering step
+qced <- cpg.qc(beta_noob_final,unmeth_signal,meth_signal,pval_final,p.cutoff=.001,cpg.miss=.1,sample.miss=.05)
+
+save(qced,file="./output_files/qced_data.rda")
+```
+####METHYLATION RISK SCORES####
+
+---
+title: "MRS_exercise.Rmd"
+author: "Karen Conneely"
+date: "2024-05-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Setup and libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Call libraries we'll need
+library(tidyverse)
+library(minfi)
+library(methylclock)
+library(CpGassoc)
+library(Tmisc)
+```
+
+In this exercise we'll use the 450k data we preprocessed earlier.  This mini-dataset is based on whole blood samples from 11 women in a larger study of Swedish twins. 
+``` {r Load data and examine}
+load("./datasets/sampleinfo.rda")
+ls()
+sampleinfo  #11 women with age range from 48-98
+
+load("./output_files/SATSA_beta_noob.rda")
+ls()  # This is the same beta_noob object we created in Project 3
+```
+Note that we're using data that are pre-processed but not QCed; this is because the QC step may have removed CpGs needed by the various MRS we are going to try. 
+
+In this exercise we'll fit several Methylation Risk Scores (MRSs) for age, and compare each set of estimates to the actual age of these individuals.
+
+First, we'll fit an EWAS-based MRS using sets of coefficients from two different EWAS:
+
+1) The age EWAS from Exercise 1.  This is a kind of "worst-case" scenario since the samples are very dissimilar and effects may be very different in adults vs. children.
+2) A published EWAS based on a longitudinal dataset of Swedish twins (1011 samples in 385 individuals).  This dataaset includes the 11 samples we have here, so this is essentially an internally derived MRS and should fit the data as well as possible (in fact, may be overfit).
+
+Step 1: get the coefficients from our earlier EWAS results
+```{r get coefficients from our age EWAS}
+load('./output_files/EWAS_exercise.rda')
+ls()       # Two new data objects loaded: age_ewas and age_ewas_ct
+
+class(age_ewas_ct)  # These are both 'cpg' objects from CpGassoc
+
+age_ewas_ct  # As long as CpGassoc was installed at the beginning this should print nicely
+
+# Recall that we can extract summary statistics and coefficients as follows:
+head(age_ewas_ct$results)
+head(age_ewas_ct$coefficients)
+
+# Making sure that the rows of these two data objects are matched by CpG
+table(row.names(age_ewas_ct$coefficients)==age_ewas_ct$results[,1])
+
+# From each set of results, we'll select a set of weights based on Holm-significant sites
+# These weights are the regression coefficients for CpGs significant in the EWAS
+age_ewas_weights <- select(filter(age_ewas$coefficients,age_ewas$results$Holm.sig),"effect.size")
+age_ewas_ct_weights <- select(filter(age_ewas_ct$coefficients,age_ewas_ct$results$Holm.sig),"effect.size")
+```
+
+We'll next select a similar set of weights from the SATSA study 
+```{r}
+satsa <- read.csv('./datasets/SATSA_EWAS_results.csv')
+head(satsa)
+dim(satsa)
+
+# These results have already been filtered to select 1316 Bonferroni-significant CpGs
+
+satsa_weights <- as.data.frame(satsa$Estimate_age_wocc,row.names=satsa[,1])
+satsa_ct_weights <- as.data.frame(satsa$Estimate_age,row.names=satsa[,1])
+```
+
+Step 2: Use the weights to compute methylation risk scores
+
+First we'll write a function to compute MRS from a given set of weights
+```{r function to compute MRS}
+compute_mrs <- function(dataset,weights) {
+  # Create dataframes containing only CpGs found in both weights and target data
+  w <- filter(weights,row.names(weights)%in%row.names(dataset))  
+  m <- dataset[row.names(dataset)%in%row.names(w),]
+  
+  k <- order(row.names(w))   # Make sure CpGs (rows) are sorted in the same order 
+  w <- w[k,]                 # in m and w
+  
+  k <- order(row.names(m))
+  m <- m[k,]
+  
+  # Use matrix multiplication to create a vector of weighted sums for each individual
+  mrs <- t(m) %*% as.matrix(w)
+  colnames(mrs)[1] <- "MRS"
+  mrs
+}
+```
+
+We'll next apply the function to create MRS based on different sets of results
+```{r compute MRS}
+extMRS <- compute_mrs(beta_noob,age_ewas_weights)
+extMRS_ct <- compute_mrs(beta_noob,age_ewas_ct_weights)
+intMRS <- compute_mrs(beta_noob,satsa_weights)
+intMRS_ct <- compute_mrs(beta_noob,satsa_ct_weights)
+
+table(row.names(sampleinfo)==row.names(extMRS)) #double-checking order
+
+# make a summary matrix that has real age along with age MRS, for comparison
+mrs_sum <- cbind(sampleinfo$Age, extMRS,extMRS_ct,intMRS,intMRS_ct)
+colnames(mrs_sum) <- c("Age","extMRS","extMRS_ct","intMRS","intMRS_ct")
+
+mrs_sum
+
+```
+Note that as simple "risk scores" these aren't expected to predict age, just to correlate with it.  This is why they don't look anything like ages, and may even take negative values.  The scale of these is irrelevant; it is only the order that matters.
+(The machine-learning scores we fit next will attempt to predict actual age)
+
+We'll now compare our MRSs to actual age to see how well they correspond
+```{r}
+cor(mrs_sum)
+```
+Correlations with true chronological age are around 0.8.  Surprisingly one of the worst-case scenarios based on our external age EWAS in young boys performs the best!
+
+One thing to note is that of the four sets of coefficients, the smallest (with only 343 coefficients) performed best.  Would the internal coefficients have performed better if we focused on just the top 343?
+
+Since the input file was sorted in order of significance, this is easy to check:
+```{r}
+intMRS_343 <- compute_mrs(beta_noob,slice_head(satsa_weights,n=343))
+intMRS_ct_343 <- compute_mrs(beta_noob,slice_head(satsa_ct_weights,n=343))
+
+mrs_sum2 <- cbind(mrs_sum,intMRS_343,intMRS_ct_343)
+colnames(mrs_sum2)[6:7] = c("intMRS_343","intMRS_343_ct")
+
+cor(mrs_sum2)
+```
+The internal MRS performed somewhat better when a smaller number of weights were used.  We could continue to play with the number of weights until we achieved an even higher correlation, but this would be a form of data-dredging that we want to avoid, and would lead to overfitting to our specific dataset. There are methods to do this using permutation tests to correct, but another approach would be to use machine learning to select an optimal model for us.
+
+Plotting our MRS results against age:
+```{r plot results}
+par(ask=TRUE)
+
+for (i in 2:7) {
+  plot(mrs_sum2[,c(1,i)],main=paste0(colnames(mrs_sum2)[i],", r = ", format(cor(mrs_sum2[,1],mrs_sum2[,i]), digits=2)))
+}
+```
+Our oldest sample seems well-predicted despite being an outlier in our PCA.
+
+Now that we've tried some simple MRS based on coefficients from EWAS, let's compare to some estimators that were designed more carefully, using machine learning approaches such as elastic net regression:
+```{r}
+par(ask=FALSE) # set this parameter back to default
+
+help(package="methylclock")
+
+help(DNAmAge)
+
+#Selecting four clocks that are specifically designed to predict age
+age_pred <- DNAmAge(beta_noob,clocks=c("Horvath","Hannum","BLUP","EN"))
+age_pred
+```
+
+Compare performance of these clocks
+```{r compare performance}
+compare <- cbind(sampleinfo$Age,age_pred[,2:5])
+compare
+
+cor(compare)
+```
+These predict age quite well, with the BLUP estimator near perfect!
+
+Unlike the methylation risk scores, they are also able to predict actual age.  We can use plots to see how closely they predict the age of these 11 women:
+```{r plots}
+mn <- min(compare)
+mx <- max(compare)
+
+par(ask=TRUE)
+
+for (i in 2:5) {
+  plot(compare[,c(1,i)],xlim=c(mn,mx),ylim=c(mn,mx),main=colnames(compare)[i])
+  text(50,100,paste("r =",format(cor(compare[,1],compare[,i]),digits=2)))
+  abline(0,1)
+}
+```
+
+#####mQTL ANALYSIS#####
+
+---
+title: "mQTL_exercise"
+author: "Karen Conneely"
+output: html_document
+date: "2024-05-24"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#install.packages("MatrixEQTL")  #Do not run - already installed
+
+library(MatrixEQTL)
+library(Tmisc)
+```
+
+For this exercise we'll use an extract of the DNAm data we used for the Project 1 EWAS, for chromosome 21 only.  Because genotype data are rarely publicly available, we'll use a "toy" dataset of 100 simulated SNPs
+``` {r load data}
+load('chr21.rda')
+ls()
+```
+Dataset contains 7 objects
+
+Let's inspect them:
+```{r examine objects in our dataset}
+dim(cpgs21)      # This is all Chromosome 21 CpGs from the Project 1 age EWAS dataset
+corner(cpgs21)   
+
+dim(snps21)     # Along with genotype data for 100 simulated SNPs
+corner(snps21)
+
+dim(cpgs21_spiked)      # The same CpGs as above, with mQTL associations spiked in
+corner(cpgs21_spiked)   
+
+dim(annot_cpgs)   # ...and chromosome and position data for all CpGs and SNPs
+head(annot_cpgs)
+
+dim(annot_snps)
+head(annot_snps)
+
+dim(pheno)        # Contains age and sex (though all are male)
+table(pheno$`gender:ch1`)
+head(pheno)       # Age will be useful as a covariates
+
+dim(cellprop)     # We also have the set of cell proportion estimates,
+head(cellprop)    # also for use as covariates
+```
+
+Double-check that sort order is the same
+```{r check order}
+table(colnames(cpgs21)==colnames(snps21))
+table(colnames(cpgs21_spiked)==colnames(snps21))
+table(row.names(pheno)==colnames(snps21))
+table(row.names(pheno)==row.names(cellprop))
+table(annot_snps[,1]==row.names(snps21))
+table(annot_cpgs[,1]==row.names(cpgs21))
+table(annot_cpgs[,1]==row.names(cpgs21_spiked))
+```
+
+Convert the data to SlicedData format used by Matrix EQTL.  Each slice will contain up to 50 rows (CpGs or SNPs) of data. (Normally we might set this to 1000 or 2000.)
+```{r slice data}
+snps <- SlicedData$new(as.matrix(snps21))
+snps$ResliceCombined(50)
+cpgs <- SlicedData$new(as.matrix(cpgs21))
+cpgs$ResliceCombined(50)
+
+# We'll also set up our matrix of covariates - cell proportion + age
+covar_matrix <- cbind(as.matrix(cellprop[,1:5]),as.numeric(pheno$`age at collection (months):ch1`))
+colnames(covar_matrix)[6] <- "Age"
+covar <- SlicedData$new(t(covar_matrix))
+
+snps
+cpgs
+covar
+```
+
+Run Matrix eQTL on the sliced datasets. 
+``` {r run matrix eQTL}
+mqtl = Matrix_eQTL_main(snps = snps, gene = cpgs, cvrt = covar, snpspos = annot_snps, genepos = annot_cpgs, cisDist = 1e6, pvOutputThreshold = .05/31500, pvOutputThreshold.cis = 1, useModel = modelLINEAR, pvalue.hist = "qqplot")
+```
+For trans associations we set the p-value threshold to account for the 31,500 tests that were performed.  For cis associations we set this to 1 so it would store results for every cis test that was performed.  For that one we'll want to actually use a cutoff of .05/3036 to adjust for the number of tests performed when identifying which associations (if any) are significant.
+
+``` {r examine output}
+names(mqtl)
+names(mqtl$cis)
+dim(mqtl$cis$eqtls)   #3036 cis association tests were performed
+head(mqtl$cis$eqtls)  #Sorted in order of significance, we can see none have FDR<.05, and the minimum p-value is larger than .05/3036 = 1.65e-5
+names(mqtl$trans)
+dim(mqtl$trans$eqtls) # No trans mQTLs are significant 
+
+plot(mqtl)
+```
+The QQ plot is consistent with a QQ plot under the null hypothesis of no associations.
+
+Q: Is it surprising that everything is consistent with the null and there were no significant mQTLs?  
+
+A: No, because we're using simulated SNP data that was simulated independently of our methylation data.  The fact that everything is coming up null means our multiple testing adjustment is successful at controlling the family-wise (experiment-wide) error rate.
+
+But in a real mQTL study we would expect to see significant associations, since 1) many CpGs are regulated or abolished by SNPs, and 2) CpGs and SNPs may also be correlated due to technical factors (e.g. SNPs on probes.)
+
+To see what a real mQTL study might look like, we'll try this again on a version of the data that has some artifical associations "spiked in".  We'll also include a p-value cutoff for our cis comparisons since now we know there were 3036:
+```{r re-run using spiked dataset}
+cpgs_spiked <- SlicedData$new(as.matrix(cpgs21_spiked))
+cpgs_spiked$ResliceCombined(50)
+
+mqtl_spike = Matrix_eQTL_main(snps = snps, gene = cpgs_spiked, snpspos = annot_snps, genepos = annot_cpgs, cisDist = 1e6, pvOutputThreshold = .05/31500, pvOutputThreshold.cis = .05/3036, useModel = modelLINEAR, pvalue.hist = "qqplot")
+```
+
+Now it looks like there are some associations.  Let's inspect them: 
+``` {r examine output}
+dim(mqtl_spike$cis$eqtls)   #85 cis associations were identified
+head(mqtl_spike$cis$eqtls)  #The top few are quite significant
+
+dim(mqtl_spike$trans$eqtls) # 40 trans mQTLs are significant 
+head(mqtl_spike$cis$eqtls) 
+length(unique(mqtl_spike$cis$eqtls$snps)) # The 85 cis mQTLs represent 3 SNPs
+length(unique(mqtl_spike$cis$eqtls$gene)) # and 85 unique CpG sites
+
+plot(mqtl_spike)
+```
+
+####BISULFITE SEQUENCING ANALYSIS####
+
+---
+title: "WGBS_exercise.Rmd"
+author: "Karen Conneely"
+date: "2024-05-20"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Packages are pre-installed, so you do NOT need to run the commented-out lines
+## Install needed Bioconductor packages
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install("GenomicRanges",force=TRUE)
+# BiocManager::install("bsseq",force=TRUE)
+# BiocManager::install("DSS",force=TRUE)
+# BiocManager::install("bsseqData",force=TRUE)
+
+# Load the installed packages
+library(bsseq)   ###bsseq package includes function for BSmooth 
+library(DSS)     ###DSS package includes Bayesian hierarchical test
+require(bsseqData)   ###Includes cancer datasets to be used below
+```
+
+In this exercise we'll analyze WGBS data for 3 matched tumor and normal samples in humans
+
+Load data from bsseqDatapackage. Data are from Bsmooth paper (Hansen et al. Nat Gen 2012) 
+```{r load data}
+##Read in data 
+data(keepLoci.ex)
+data(BS.cancer.ex.fit)
+BS.cancer.ex.fit <- updateObject(BS.cancer.ex.fit)
+BS.chr21 = BS.cancer.ex.fit[keepLoci.ex,]
+
+BS.chr21  #Inspect object.  Note that it already smoothed; normally we'd need to do this.
+```
+
+First, we'll use BSmooth to identify differentially methylated regions (DMRs)
+```{r detect DMRs with BSmooth}
+
+## Run t-test, subsetting to include CpGs passing QC
+BS.tstat <- BSmooth.tstat(BS.chr21,
+                          group1 = c("C1", "C2", "C3"),
+                          group2 = c("N1", "N2", "N3"),
+                          estimate.var = "group2")
+BS.tstat
+
+## Grab top DMRs for visualization
+DMRs = dmrFinder(BS.tstat,cutoff=c(-12,12))
+DMRs
+```
+
+Visualize DMRs in plots
+```{r plot DMRs}
+#region = GRanges(seqnames="chr22", IRanges(51144282, 51244561))
+
+range.dmr = data.frame(DMRs$start-5000,DMRs$end+5000,DMRs$chr)
+names(range.dmr) = c("start","end","chr")
+par(ask=TRUE)
+plotManyRegions(BS.cancer.ex.fit,range.dmr,addPoints=TRUE,col=c(2,2,2,4,4,4))
+```
+
+Next: DMR detection using DSS
+
+Normally we would run the step commented out below.  But since this step would take several minutes to run, I ran it ahead of time so we can just read in the resulting data object below.
+#### dmlTest = DMLtest(BS.chr21, c("C1","C2","C3"),c("N1","N2","N3"), smoothing=TRUE) 
+####save(dmlTest,file="./datasets/dmlTest.rda")
+
+Load output generated by DSS
+```{r load output}
+load("./datasets/dmlTest.rda")
+par(ask=FALSE)
+hist(dmlTest$stat)
+```
+
+Use DML results to call DMRs, and visualize using DSS and BSmooth
+```{r call DMR}
+dmr.DSS = callDMR(dmlTest, delta=0.1, p.threshold=1e-5)
+head(dmr.DSS)
+
+# Visualize top DMR using DSS (you may need to enlarge your plot window here)
+showOneDMR(dmr.DSS[1,], BS.chr21)
+```
+
+For comparison, visualize using BSmooth
+```{r revisualize}
+plotRegion(BS.chr21, dmr.DSS[1,], extend=1000, col=c(2,2,2,4,4,4),addPoints=T)
+```
+
+Finally, DSS can perform differential methylation analysis evenwhen there are no biological replicates (i.e., just one sample in each group)
+
+```{r no replicate case}
+### Grab one replicate from cancer and one from normal 
+BS.1rep = BS.chr21[,c(1,4)]
+
+### Another time-consuming part we'll skip - would take several minutes or more
+### dmlTest1 = DMLtest(BS.1rep, c("C1"),c("N1"), smoothing=TRUE)
+### save(dmlTest,dmlTest1,file="./datasets/dmlTest.rda")
+
+dmr1.DSS = callDMR(dmlTest1, delta=0.1, p.threshold=1e-5)
+head(dmr1.DSS)
+showOneDMR(dmr1.DSS[1,], BS.1rep)
